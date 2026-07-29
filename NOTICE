@@ -1,0 +1,9 @@
+mojo-qhull contains a derived Mojo port of Qhull.
+
+Qhull copyright (c) 1993-2020 C.B. Barber and The Geometry Center,
+University of Minnesota. The upstream source is available from
+http://www.qhull.org/ and is redistributed under the terms in
+QHULL-LICENSE.txt.
+
+Modifications: Lee Penkman, 2026-07-29. The pointer-based reentrant C core was
+adapted to flat caller-owned buffers and a C ABI suitable for Mojo/Python FFI.
