@@ -99,35 +99,40 @@ The hull uses flat structure-of-arrays storage: `int64` simplex indices,
 `float64` normalized facet equations, an integer facet-state array, and one
 outside-facet assignment per point. Horizon ridges are matched by indices
 instead of Qhull's pointer-linked facet graph. Dead facet slots are reused and
-facet adjacency is maintained incrementally, so horizon discovery does not
-rescan every historical facet. Plane dot products and the general-dimensional
-plane normalization use native-width float64 SIMD with scalar remainder loops;
-2D and 3D planes use direct closed forms. Delaunay runs the same hull on the
-scaled paraboloid lift and keeps lower facets. Voronoi centers are dense small
-solves over Delaunay simplices. Halfspaces are mapped to polar points; polar
-hull planes map back to primal intersection vertices.
+facet adjacency is maintained incrementally. Visible facets are traversed from
+the eye point's assigned facet, and point reassignment selects the next eye in
+the same pass. Delaunay reuses the maintained adjacency and compacts lower
+facets in place instead of rebuilding topology or copying result buffers in
+NumPy.
 
-CPU execution remains serial at the measured sizes. The independent point
-passes do only `O(dim)` work per item, while hull updates are irregular and
-dependent, so there is not enough coarse independent work to justify thread
-launches here. There is no GPU path: plane distance and paraboloid lifting are
-about 0.125 flop/byte, well below the roughly 2 flop/byte threshold, while
-horizon updates are control-heavy. Device transfers would therefore make
-these kernels slower. NumPy float64 C-contiguous inputs remain zero-copy across
-the FFI boundary. Other real NumPy dtypes and layouts are converted to
-C-contiguous float64; complex-valued inputs are rejected instead of narrowed.
+Plane dot products, general-dimensional plane normalization, paraboloid
+lifting, polar transforms, and Voronoi-center assembly use native-width
+float64 SIMD with scalar remainder loops; 2D and 3D planes use direct closed
+forms. Large independent batches of Voronoi-center solves run in parallel once
+`count * dim * dim >= 32768`; benchmark-sized batches stay serial to avoid
+thread-launch overhead. Halfspaces are mapped to polar points, and polar hull
+planes map back to primal intersection vertices with native tolerance-based
+deduplication for ordinary result sizes.
+
+There is no GPU path. Plane distance, paraboloid lifting, and polar transforms
+are far below the roughly 2 flop/byte threshold, while horizon updates are
+control-heavy. High-dimensional center solves can have more arithmetic per
+byte, but normal batches are too small to repay device transfers and launch
+costs. NumPy float64 C-contiguous inputs remain zero-copy across the FFI
+boundary. Other real NumPy dtypes and layouts are converted to C-contiguous
+float64; complex-valued inputs are rejected instead of narrowed.
 
 ## Benchmarks
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux 6.8.0-136, x86-64. Each entry is the best of three complete Python API
-calls. SciPy uses its mature upstream Qhull binding. Mojo is faster for the
-large 2D hull case and slower for the other measured cases.
+calls. SciPy uses its mature upstream Qhull binding. Mojo is faster for all
+measured cases.
 
 | case | mojo-qhull | SciPy/Qhull | ratio |
 |---|---:|---:|---:|
-| Convex hull (20k x 2) | 3.483 ms | 6.758 ms | 1.94x faster |
-| Convex hull (5k x 3) | 2.385 ms | 2.379 ms | 1.00x slower |
-| Delaunay (300 x 2) | 4.079 ms | 2.021 ms | 0.50x slower |
-| Voronoi (300 x 2) | 5.798 ms | 3.589 ms | 0.62x slower |
-| Halfspace intersection (120 x 3) | 1.399 ms | 0.910 ms | 0.65x slower |
+| Convex hull (20k x 2) | 1.051 ms | 3.083 ms | 2.93x faster |
+| Convex hull (5k x 3) | 0.809 ms | 1.332 ms | 1.65x faster |
+| Delaunay (300 x 2) | 0.846 ms | 1.025 ms | 1.21x faster |
+| Voronoi (300 x 2) | 1.413 ms | 1.596 ms | 1.13x faster |
+| Halfspace intersection (120 x 3) | 0.379 ms | 0.541 ms | 1.43x faster |

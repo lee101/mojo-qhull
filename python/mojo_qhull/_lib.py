@@ -11,13 +11,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 LIB = os.environ.get("MOJO_QHULL_LIB", os.path.join(ROOT, "dist", "libmojo-qhull.so"))
 
 I = ctypes.c_int64
+D = ctypes.c_double
 
 _SIGNATURES = {
     "mq_convex_hull": ([I] * 16, I),
     "mq_lift_delaunay": ([I] * 4, None),
     "mq_halfspace_dual": ([I] * 5, I),
     "mq_polar_vertices": ([I] * 5, I),
-    "mq_circumcenters": ([I] * 7, I),
+    "mq_compact_unique_rows": ([I] * 4 + [D], I),
+    "mq_topology_ridges": ([I] * 7, I),
+    "mq_filter_lower_facets": ([I] * 7 + [D], I),
+    "mq_circumcenters": ([I] * 8, I),
 }
 
 _library: ctypes.CDLL | None = None

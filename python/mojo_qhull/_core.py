@@ -24,7 +24,7 @@ def points_array(points) -> np.ndarray:
     return result
 
 
-def raw_hull(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def raw_hull(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n, dim = points.shape
     if n < dim + 1:
         raise QhullError(f"not enough points ({n}) to construct a {dim}-d hull")
@@ -61,7 +61,7 @@ def raw_hull(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             addr(point_distances),
         )
         if count >= 0:
-            return facets[:count].copy(), planes[:count].copy()
+            return facets[:count], planes[:count], neighbors[:count]
         if count == -2:
             raise QhullError("input is less than full dimensional")
         if count != -3:
@@ -91,19 +91,55 @@ def hull_measures(
     return float(area), float(volume)
 
 
-def delaunay_arrays(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def delaunay_arrays(
+    points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n, dim = points.shape
     if n < dim + 1:
         raise QhullError(f"not enough points ({n}) for a {dim}-d triangulation")
     lifted = np.empty((n + 1, dim + 1), dtype=np.float64)
     lib().mq_lift_delaunay(addr(points), addr(lifted), n, dim)
-    facets, equations = raw_hull(lifted)
+    facets, equations, hull_neighbors = raw_hull(lifted)
     cutoff = -2.0 * 1.01 * (dim + 1) * np.finfo(np.float64).eps
-    keep = (equations[:, dim] < cutoff) & np.all(facets != n, axis=1)
-    simplices = facets[keep].copy()
-    if len(simplices) == 0:
+    mapping = np.empty(len(facets), dtype=np.int64)
+    count = lib().mq_filter_lower_facets(
+        addr(facets),
+        addr(equations),
+        addr(hull_neighbors),
+        addr(mapping),
+        len(facets),
+        dim + 1,
+        n,
+        cutoff,
+    )
+    if count == 0:
         raise QhullError("no lower facets in lifted hull")
-    return simplices, equations[keep].copy()
+    return facets[:count], equations[:count], hull_neighbors[:count]
+
+
+def topology_from_neighbors(
+    simplices: np.ndarray, neighbors: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    count, width = simplices.shape
+    capacity = count * width
+    ridge_points = np.empty((capacity, width - 1), dtype=np.int64)
+    first = np.empty(capacity, dtype=np.int64)
+    second = np.empty(capacity, dtype=np.int64)
+    ridge_count = lib().mq_topology_ridges(
+        addr(simplices),
+        addr(neighbors),
+        addr(ridge_points),
+        addr(first),
+        addr(second),
+        count,
+        width,
+    )
+    return (
+        neighbors,
+        ridge_points[:ridge_count],
+        first[:ridge_count],
+        second[:ridge_count],
+    )
 
 
 def simplex_topology(
@@ -141,8 +177,9 @@ def simplex_neighbors(simplices: np.ndarray) -> np.ndarray:
 def circumcenters(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     dim = points.shape[1]
     centers = np.empty((len(simplices), dim), dtype=np.float64)
-    matrix = np.empty((dim, dim), dtype=np.float64)
-    rhs = np.empty(dim, dtype=np.float64)
+    matrix = np.empty((len(simplices), dim, dim), dtype=np.float64)
+    rhs = np.empty((len(simplices), dim), dtype=np.float64)
+    statuses = np.empty(len(simplices), dtype=np.int64)
     status = lib().mq_circumcenters(
         addr(points),
         addr(simplices),
@@ -151,6 +188,7 @@ def circumcenters(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
         dim,
         addr(matrix),
         addr(rhs),
+        addr(statuses),
     )
     if status < 0:
         raise QhullError("singular Delaunay simplex")

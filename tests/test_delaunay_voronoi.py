@@ -6,6 +6,7 @@ from scipy.spatial import Delaunay as SciPyDelaunay
 from scipy.spatial import Voronoi as SciPyVoronoi
 
 from mojo_qhull import Delaunay, QhullError, Voronoi, delaunay, voronoi
+from mojo_qhull._core import circumcenters
 
 
 def simplex_set(array):
@@ -130,6 +131,21 @@ def test_benchmark_scale_delaunay_adjacency_matches_qhull():
     expected = SciPyDelaunay(points)
     assert simplex_set(actual.simplices) == simplex_set(expected.simplices)
     assert np.count_nonzero(actual.neighbors < 0) == len(expected.convex_hull)
+
+
+def test_delaunay_simd_tail_dimension_matches_qhull():
+    points = np.random.default_rng(607).normal(size=(14, 6))
+    actual = Delaunay(points)
+    expected = SciPyDelaunay(points)
+    assert simplex_set(actual.simplices) == simplex_set(expected.simplices)
+
+
+@pytest.mark.parametrize("count", [32, 8192])
+def test_circumcenter_serial_and_parallel_thresholds(count):
+    points = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    simplices = np.tile(np.array([[0, 1, 2]], dtype=np.int64), (count, 1))
+    centers = circumcenters(points, simplices)
+    np.testing.assert_allclose(centers, 0.5)
 
 
 def test_delaunay_and_voronoi_convenience_functions():

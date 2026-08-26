@@ -8,11 +8,13 @@ planes are [normal..., offset], and state arrays replace Qhull's pointer graph.
 # Center. See QHULL-LICENSE.txt and NOTICE in the repository root.
 
 from std.math import sqrt
+from std.runtime.asyncrt import TaskGroup, initialize_runtime, parallelism_level
 from std.sys import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime REAL_EPSILON = 2.220446049250313e-16
+comptime PARALLEL_SOLVE_WORK = 32_768
 
 
 def fp(addr: Int) -> FPtr:
@@ -21,6 +23,31 @@ def fp(addr: Int) -> FPtr:
 
 def ip(addr: Int) -> IPtr:
     return IPtr(unsafe_from_address=addr)
+
+
+@always_inline
+def parallelize[
+    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
+](num_work_items: Int):
+    if num_work_items <= 0:
+        return
+    if num_work_items == 1:
+        func(0)
+        return
+    initialize_runtime()
+    var num_workers = min(num_work_items, parallelism_level())
+    var chunk_size, extra_items = divmod(num_work_items, num_workers)
+
+    async def work_chunk(worker: Int, chunk_size: Int, extra_items: Int):
+        var begin = worker * chunk_size + min(worker, extra_items)
+        var count = chunk_size + Int(worker < extra_items)
+        for i in range(begin, begin + count):
+            func(i)
+
+    var tasks = TaskGroup()
+    for worker in range(num_workers):
+        tasks.create_task(work_chunk(worker, chunk_size, extra_items))
+    tasks.wait()
 
 
 # qhull: src/libqhull_r/geom_r.c qh_distplane
@@ -386,6 +413,8 @@ def quickhull(
                     break
 
     # qhull: src/libqhull_r/libqhull_r.c qh_partitionall
+    var eye = -1
+    var furthest = 2.0 * roundoff
     for i in range(n):
         point_facets[i] = -1
         point_distances[i] = 2.0 * roundoff
@@ -394,32 +423,38 @@ def quickhull(
             if distance > point_distances[i]:
                 point_distances[i] = distance
                 point_facets[i] = Int64(f)
+        if point_facets[i] >= 0 and point_distances[i] > furthest:
+            furthest = point_distances[i]
+            eye = i
 
     var iterations = 0
-    while iterations < n:
-        var eye = -1
-        var furthest = 2.0 * roundoff
-        for i in range(n):
-            if point_facets[i] >= 0 and point_distances[i] > furthest:
-                furthest = point_distances[i]
-                eye = i
-        if eye < 0:
-            break
-
-        var visible_count = 0
-        for f in range(facet_count):
-            if alive[f] == 1 and dist_plane(points, eye, dim, planes, f) > roundoff:
-                alive[f] = 2
-                visible_count += 1
+    while iterations < n and eye >= 0:
+        var visible_count = 1
+        var first_visible = Int(point_facets[eye])
+        alive[first_visible] = 2
+        new_facets[capacity - 1] = Int64(first_visible)
+        var visible_i = 0
+        while visible_i < visible_count:
+            var visible_facet = Int(new_facets[capacity - 1 - visible_i])
+            for omitted in range(dim):
+                var adjacent = Int(neighbors[visible_facet * dim + omitted])
+                if (
+                    adjacent >= 0
+                    and alive[adjacent] == 1
+                    and dist_plane(points, eye, dim, planes, adjacent) > roundoff
+                ):
+                    alive[adjacent] = 2
+                    new_facets[capacity - 1 - visible_count] = Int64(adjacent)
+                    visible_count += 1
+            visible_i += 1
         if visible_count == 0:
             break
 
         var before_new = facet_count
         var next_free = 0
         var new_count = 0
-        for f in range(before_new):
-            if alive[f] != 2:
-                continue
+        for visible_index in range(visible_count):
+            var f = Int(new_facets[capacity - 1 - visible_index])
             for omitted in range(dim):
                 var neighbor = Int(neighbors[f * dim + omitted])
                 if neighbor >= 0:
@@ -454,6 +489,8 @@ def quickhull(
                             if neighbors[neighbor * dim + neighbor_omitted] == Int64(f):
                                 neighbors[neighbor * dim + neighbor_omitted] = Int64(new_facet)
                                 break
+                        if new_count >= capacity - visible_count:
+                            return -3
                         new_facets[new_count] = Int64(new_facet)
                         new_count += 1
 
@@ -475,34 +512,50 @@ def quickhull(
                         break
 
         # qhull: src/libqhull_r/poly_r.c qh_partitionvisible
+        var next_eye = -1
+        var next_furthest = 2.0 * roundoff
         for i in range(n):
             var assigned = point_facets[i]
             if assigned >= 0 and alive[Int(assigned)] == 2:
                 point_facets[i] = -1
                 point_distances[i] = 2.0 * roundoff
-                for f in range(facet_count):
-                    if alive[f] == 3:
-                        var distance = dist_plane(points, i, dim, planes, f)
-                        if distance > point_distances[i]:
-                            point_distances[i] = distance
-                            point_facets[i] = Int64(f)
-        for f in range(before_new):
-            if alive[f] == 2:
-                alive[f] = 0
-        for f in range(facet_count):
-            if alive[f] == 3:
-                alive[f] = 1
+                for new_i in range(new_count):
+                    var new_facet = Int(new_facets[new_i])
+                    var distance = dist_plane(points, i, dim, planes, new_facet)
+                    if distance > point_distances[i]:
+                        point_distances[i] = distance
+                        point_facets[i] = Int64(new_facet)
+            if point_facets[i] >= 0 and point_distances[i] > next_furthest:
+                next_furthest = point_distances[i]
+                next_eye = i
+        for visible_index in range(visible_count):
+            alive[Int(new_facets[capacity - 1 - visible_index])] = 0
+        for new_i in range(new_count):
+            alive[Int(new_facets[new_i])] = 1
+        eye = next_eye
         iterations += 1
 
     var output_count = 0
     for f in range(facet_count):
         if alive[f] == 1:
-            if output_count != f:
-                for j in range(dim):
-                    facets[output_count * dim + j] = facets[f * dim + j]
-                for j in range(dim + 1):
-                    planes[output_count * (dim + 1) + j] = planes[f * (dim + 1) + j]
+            alive[f] = Int64(output_count)
             output_count += 1
+        else:
+            alive[f] = -1
+    for f in range(facet_count):
+        var output_f = Int(alive[f])
+        if output_f >= 0:
+            if output_f != f:
+                for j in range(dim):
+                    facets[output_f * dim + j] = facets[f * dim + j]
+                for j in range(dim + 1):
+                    planes[output_f * (dim + 1) + j] = planes[f * (dim + 1) + j]
+            for j in range(dim):
+                var neighbor = Int(neighbors[f * dim + j])
+                if neighbor >= 0:
+                    neighbors[output_f * dim + j] = alive[neighbor]
+                else:
+                    neighbors[output_f * dim + j] = -1
     return output_count
 
 
@@ -556,12 +609,23 @@ def mq_lift_delaunay(points_addr: Int, lifted_addr: Int, n: Int, dim: Int) abi("
         lifted[n * (dim + 1) + k] = 0.0
     for i in range(n):
         var paraboloid = 0.0
-        for k in range(dim):
+        comptime W = simd_width_of[DType.float64]()
+        var k = 0
+        while k + W <= dim:
+            var values = points.load[width=W](i * dim + k)
+            lifted.store(i * (dim + 1) + k, values)
+            var mean = lifted.load[width=W](n * (dim + 1) + k)
+            lifted.store(n * (dim + 1) + k, mean + values / Float64(n))
+            paraboloid += (values * values).reduce_add()
+            maxcoord = max(maxcoord, abs(values).reduce_max())
+            k += W
+        while k < dim:
             var value = points[i * dim + k]
             lifted[i * (dim + 1) + k] = value
             lifted[n * (dim + 1) + k] += value / Float64(n)
             paraboloid += value * value
             maxcoord = max(maxcoord, abs(value))
+            k += 1
         lifted[i * (dim + 1) + dim] = paraboloid
         maxboloid = max(maxboloid, paraboloid)
     lifted[n * (dim + 1) + dim] = max(maxboloid * 1.1, 1.0)
@@ -594,12 +658,30 @@ def mq_halfspace_dual(
     var dual = fp(dual_addr)
     for i in range(count):
         var distance = halfspaces[i * (dim + 1) + dim]
-        for k in range(dim):
+        comptime W = simd_width_of[DType.float64]()
+        var k = 0
+        while k + W <= dim:
+            distance += (
+                halfspaces.load[width=W](i * (dim + 1) + k)
+                * feasible.load[width=W](k)
+            ).reduce_add()
+            k += W
+        while k < dim:
             distance += halfspaces[i * (dim + 1) + k] * feasible[k]
+            k += 1
         if distance >= 0.0:
             return -(i + 1)
-        for k in range(dim):
+        var inverse = -1.0 / distance
+        k = 0
+        while k + W <= dim:
+            dual.store(
+                i * dim + k,
+                halfspaces.load[width=W](i * (dim + 1) + k) * inverse,
+            )
+            k += W
+        while k < dim:
             dual[i * dim + k] = halfspaces[i * (dim + 1) + k] / -distance
+            k += 1
     return 0
 
 
@@ -619,11 +701,150 @@ def mq_polar_vertices(
         var offset = planes[i * (dim + 1) + dim]
         if offset >= 0.0:
             return -1
-        for k in range(dim):
+        comptime W = simd_width_of[DType.float64]()
+        var k = 0
+        while k + W <= dim:
+            vertices.store(
+                i * dim + k,
+                feasible.load[width=W](k)
+                - planes.load[width=W](i * (dim + 1) + k) / offset,
+            )
+            k += W
+        while k < dim:
             vertices[i * dim + k] = (
                 feasible[k] - planes[i * (dim + 1) + k] / offset
             )
+            k += 1
     return count
+
+
+@export("mq_compact_unique_rows")
+def mq_compact_unique_rows(
+    values_addr: Int,
+    quantized_addr: Int,
+    count: Int,
+    dim: Int,
+    quantum: Float64,
+) abi("C") -> Int:
+    var values = fp(values_addr)
+    var quantized = fp(quantized_addr)
+    for i in range(count):
+        for k in range(dim):
+            quantized[i * dim + k] = round(values[i * dim + k] / quantum)
+
+    var unique_count = 0
+    for i in range(count):
+        var duplicate = False
+        for existing in range(unique_count):
+            var equal = True
+            for k in range(dim):
+                if quantized[i * dim + k] != quantized[existing * dim + k]:
+                    equal = False
+                    break
+            if equal:
+                duplicate = True
+                break
+        if not duplicate:
+            if unique_count != i:
+                for k in range(dim):
+                    values[unique_count * dim + k] = values[i * dim + k]
+                    quantized[unique_count * dim + k] = quantized[i * dim + k]
+            unique_count += 1
+    return unique_count
+
+
+@export("mq_topology_ridges")
+def mq_topology_ridges(
+    simplices_addr: Int,
+    neighbors_addr: Int,
+    ridge_points_addr: Int,
+    first_addr: Int,
+    second_addr: Int,
+    count: Int,
+    width: Int,
+) abi("C") -> Int:
+    var simplices = ip(simplices_addr)
+    var neighbors = ip(neighbors_addr)
+    var ridge_points = ip(ridge_points_addr)
+    var first = ip(first_addr)
+    var second = ip(second_addr)
+    var ridge_count = 0
+    for owner in range(count):
+        for opposite in range(width):
+            var neighbor = neighbors[owner * width + opposite]
+            if neighbor >= 0 and Int64(owner) >= neighbor:
+                continue
+            var column_out = 0
+            for column in range(width):
+                if column != opposite:
+                    ridge_points[ridge_count * (width - 1) + column_out] = (
+                        simplices[owner * width + column]
+                    )
+                    column_out += 1
+            for column in range(1, width - 1):
+                var value = ridge_points[ridge_count * (width - 1) + column]
+                var insertion = column
+                while (
+                    insertion > 0
+                    and ridge_points[ridge_count * (width - 1) + insertion - 1]
+                    > value
+                ):
+                    ridge_points[ridge_count * (width - 1) + insertion] = (
+                        ridge_points[ridge_count * (width - 1) + insertion - 1]
+                    )
+                    insertion -= 1
+                ridge_points[ridge_count * (width - 1) + insertion] = value
+            first[ridge_count] = Int64(owner)
+            second[ridge_count] = neighbor
+            ridge_count += 1
+    return ridge_count
+
+
+@export("mq_filter_lower_facets")
+def mq_filter_lower_facets(
+    facets_addr: Int,
+    planes_addr: Int,
+    neighbors_addr: Int,
+    mapping_addr: Int,
+    count: Int,
+    dim: Int,
+    infinity: Int,
+    cutoff: Float64,
+) abi("C") -> Int:
+    var facets = ip(facets_addr)
+    var planes = fp(planes_addr)
+    var neighbors = ip(neighbors_addr)
+    var mapping = ip(mapping_addr)
+    var kept_count = 0
+    for f in range(count):
+        var keep = planes[f * (dim + 1) + dim - 1] < cutoff
+        if keep:
+            for k in range(dim):
+                if facets[f * dim + k] == Int64(infinity):
+                    keep = False
+                    break
+        if keep:
+            mapping[f] = Int64(kept_count)
+            kept_count += 1
+        else:
+            mapping[f] = -1
+
+    for f in range(count):
+        var output_f = Int(mapping[f])
+        if output_f < 0:
+            continue
+        if output_f != f:
+            for k in range(dim):
+                facets[output_f * dim + k] = facets[f * dim + k]
+            for k in range(dim + 1):
+                planes[output_f * (dim + 1) + k] = planes[f * (dim + 1) + k]
+        for k in range(dim):
+            var neighbor = neighbors[f * dim + k]
+            if neighbor >= 0:
+                neighbors[output_f * dim + k] = mapping[Int(neighbor)]
+            else:
+                neighbors[output_f * dim + k] = -1
+    return kept_count
 
 
 # qhull: src/libqhull_r/geom2_r.c qh_gausselim/qh_backnormal
@@ -662,6 +883,59 @@ def solve_linear(a: FPtr, b: FPtr, n: Int) -> Bool:
 
 
 # qhull: src/libqhull_r/geom2_r.c qh_voronoi_center
+def circumcenter_one(
+    points: FPtr,
+    simplices: IPtr,
+    centers: FPtr,
+    matrix: FPtr,
+    rhs: FPtr,
+    s: Int,
+    dim: Int,
+) -> Bool:
+    var matrix_base = s * dim * dim
+    var rhs_base = s * dim
+    var base = Int(simplices[s * (dim + 1)])
+    var base_norm2 = 0.0
+    comptime W = simd_width_of[DType.float64]()
+    var k = 0
+    while k + W <= dim:
+        var values = points.load[width=W](base * dim + k)
+        base_norm2 += (values * values).reduce_add()
+        k += W
+    while k < dim:
+        var value = points[base * dim + k]
+        base_norm2 += value * value
+        k += 1
+    for row in range(dim):
+        var vertex = Int(simplices[s * (dim + 1) + row + 1])
+        var vertex_norm2 = 0.0
+        k = 0
+        while k + W <= dim:
+            var values = points.load[width=W](vertex * dim + k)
+            var base_values = points.load[width=W](base * dim + k)
+            vertex_norm2 += (values * values).reduce_add()
+            matrix.store(matrix_base + row * dim + k, 2.0 * (values - base_values))
+            k += W
+        while k < dim:
+            var value = points[vertex * dim + k]
+            vertex_norm2 += value * value
+            matrix[matrix_base + row * dim + k] = 2.0 * (
+                value - points[base * dim + k]
+            )
+            k += 1
+        rhs[rhs_base + row] = vertex_norm2 - base_norm2
+    if not solve_linear(matrix + matrix_base, rhs + rhs_base, dim):
+        return False
+    k = 0
+    while k + W <= dim:
+        centers.store(s * dim + k, rhs.load[width=W](rhs_base + k))
+        k += W
+    while k < dim:
+        centers[s * dim + k] = rhs[rhs_base + k]
+        k += 1
+    return True
+
+
 @export("mq_circumcenters")
 def mq_circumcenters(
     points_addr: Int,
@@ -671,30 +945,27 @@ def mq_circumcenters(
     dim: Int,
     matrix_addr: Int,
     rhs_addr: Int,
+    statuses_addr: Int,
 ) abi("C") -> Int:
     var points = fp(points_addr)
     var simplices = ip(simplices_addr)
     var centers = fp(centers_addr)
     var matrix = fp(matrix_addr)
     var rhs = fp(rhs_addr)
+    var statuses = ip(statuses_addr)
+
+    @parameter
+    def solve_one(s: Int):
+        statuses[s] = Int64(
+            circumcenter_one(points, simplices, centers, matrix, rhs, s, dim)
+        )
+
+    if count * dim * dim >= PARALLEL_SOLVE_WORK:
+        parallelize[solve_one](count)
+    else:
+        for s in range(count):
+            solve_one(s)
     for s in range(count):
-        var base = Int(simplices[s * (dim + 1)])
-        var base_norm2 = 0.0
-        for k in range(dim):
-            var value = points[base * dim + k]
-            base_norm2 += value * value
-        for row in range(dim):
-            var vertex = Int(simplices[s * (dim + 1) + row + 1])
-            var vertex_norm2 = 0.0
-            for k in range(dim):
-                var value = points[vertex * dim + k]
-                vertex_norm2 += value * value
-                matrix[row * dim + k] = 2.0 * (
-                    value - points[base * dim + k]
-                )
-            rhs[row] = vertex_norm2 - base_norm2
-        if not solve_linear(matrix, rhs, dim):
+        if statuses[s] == 0:
             return -(s + 1)
-        for k in range(dim):
-            centers[s * dim + k] = rhs[k]
     return count

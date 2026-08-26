@@ -13,7 +13,7 @@ from ._core import (
     hull_measures,
     points_array,
     raw_hull,
-    simplex_topology,
+    topology_from_neighbors,
 )
 from ._lib import addr, f64, lib
 
@@ -23,7 +23,7 @@ class ConvexHull:
 
     def __init__(self, points):
         self.points = points_array(points)
-        self.simplices, self.equations = raw_hull(self.points)
+        self.simplices, self.equations, _ = raw_hull(self.points)
         self.vertices = np.unique(self.simplices)
         if self.points.shape[1] == 2:
             center = self.points[self.vertices].mean(axis=0)
@@ -42,13 +42,13 @@ class Delaunay:
 
     def __init__(self, points):
         self.points = points_array(points)
-        self.simplices, lifted_equations = delaunay_arrays(self.points)
+        self.simplices, lifted_equations, hull_neighbors = delaunay_arrays(self.points)
         (
             self.neighbors,
             self._ridge_points,
             self._ridge_first,
             self._ridge_second,
-        ) = simplex_topology(self.simplices)
+        ) = topology_from_neighbors(self.simplices, hull_neighbors)
         self.convex_hull = self._ridge_points[self._ridge_second < 0]
         self.ndim = self.points.shape[1]
         self.nsimplex = len(self.simplices)
@@ -104,8 +104,12 @@ class Voronoi:
         )
         order = np.lexsort((flat_centers, flat_points))
         counts = np.bincount(flat_points, minlength=len(self.points))
-        grouped = np.split(flat_centers[order], np.cumsum(counts)[:-1])
-        self.regions = [group.tolist() for group in grouped]
+        ordered_centers = flat_centers[order]
+        offsets = np.concatenate(([0], np.cumsum(counts)))
+        self.regions = [
+            ordered_centers[offsets[i] : offsets[i + 1]].tolist()
+            for i in range(len(self.points))
+        ]
         self.point_region = np.arange(len(self.points), dtype=np.int64)
         for point_i in np.unique(triangulation.convex_hull):
             self.regions[int(point_i)].append(-1)
@@ -142,7 +146,7 @@ class HalfspaceIntersection:
             raise QhullError(
                 f"interior point is not strictly inside halfspace {-status - 1}"
             )
-        dual_facets, dual_equations = raw_hull(dual)
+        dual_facets, dual_equations, _ = raw_hull(dual)
         intersections = np.empty((len(dual_facets), dim), dtype=np.float64)
         status = lib().mq_polar_vertices(
             addr(dual_equations),
@@ -154,12 +158,26 @@ class HalfspaceIntersection:
         if status < 0:
             raise QhullError("polar hull does not define a bounded intersection")
         scale = max(float(np.abs(intersections).max()), 1.0)
-        rounded = np.round(intersections / (64 * np.finfo(float).eps * scale))
-        _, unique = np.unique(rounded, axis=0, return_index=True)
-        self.intersections = intersections[np.sort(unique)]
+        quantum = 64 * np.finfo(float).eps * scale
+        if len(intersections) <= 1024:
+            quantized = np.empty_like(intersections)
+            unique_count = lib().mq_compact_unique_rows(
+                addr(intersections),
+                addr(quantized),
+                len(intersections),
+                dim,
+                quantum,
+            )
+            self.intersections = intersections[:unique_count]
+        else:
+            rounded = np.round(intersections / quantum)
+            _, unique = np.unique(rounded, axis=0, return_index=True)
+            self.intersections = intersections[np.sort(unique)]
         self.dual_points = dual
         self.dual_facets = dual_facets
-        self.dual_vertices = np.unique(dual_facets)
+        present = np.zeros(count, dtype=bool)
+        present[dual_facets] = True
+        self.dual_vertices = np.flatnonzero(present)
         self.ndim = dim
 
 

@@ -3,6 +3,7 @@ import pytest
 from scipy.spatial import HalfspaceIntersection as SciPyHalfspaceIntersection
 
 from mojo_qhull import HalfspaceIntersection, QhullError, halfspace_intersection
+from mojo_qhull._lib import addr, lib
 
 
 def sorted_rows(array, decimals=12):
@@ -89,6 +90,36 @@ def test_nonfinite_halfspace_inputs_are_rejected_before_ffi(
 ):
     with pytest.raises(ValueError, match=message):
         HalfspaceIntersection(halfspaces, feasible)
+
+
+def test_halfspace_simd_tail_dimension_matches_qhull():
+    dim = 6
+    halfspaces = np.zeros((2 * dim, dim + 1))
+    for axis in range(dim):
+        halfspaces[2 * axis, axis] = -1.0
+        halfspaces[2 * axis + 1, axis] = 1.0
+        halfspaces[2 * axis + 1, -1] = -1.0
+    feasible = np.full(dim, 0.5)
+    actual = HalfspaceIntersection(halfspaces, feasible)
+    expected = SciPyHalfspaceIntersection(halfspaces, feasible)
+    np.testing.assert_allclose(
+        sorted_rows(actual.intersections),
+        sorted_rows(expected.intersections),
+        atol=2e-12,
+    )
+
+
+def test_native_row_compaction_preserves_first_occurrences():
+    quantum = 1e-6
+    values = np.array(
+        [[1.0, 2.0], [1.0 + 0.1 * quantum, 2.0], [3.0, 4.0], [1.0, 2.0]]
+    )
+    quantized = np.empty_like(values)
+    count = lib().mq_compact_unique_rows(
+        addr(values), addr(quantized), len(values), values.shape[1], quantum
+    )
+    assert count == 2
+    np.testing.assert_array_equal(values[:count], [[1.0, 2.0], [3.0, 4.0]])
 
 
 def test_halfspace_convenience_function():
