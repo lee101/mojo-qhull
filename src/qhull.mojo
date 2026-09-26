@@ -8,14 +8,11 @@ planes are [normal..., offset], and state arrays replace Qhull's pointer graph.
 # Center. See QHULL-LICENSE.txt and NOTICE in the repository root.
 
 from std.math import sqrt
-from std.runtime.asyncrt import TaskGroup, initialize_runtime, parallelism_level
 from std.sys import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime REAL_EPSILON = 2.220446049250313e-16
-comptime PARALLEL_SOLVE_WORK = 32_768
-
 
 def fp(addr: Int) -> FPtr:
     return FPtr(unsafe_from_address=addr)
@@ -25,29 +22,6 @@ def ip(addr: Int) -> IPtr:
     return IPtr(unsafe_from_address=addr)
 
 
-@always_inline
-def parallelize[
-    origins: OriginSet, //, func: def(Int) capturing[origins] -> None
-](num_work_items: Int):
-    if num_work_items <= 0:
-        return
-    if num_work_items == 1:
-        func(0)
-        return
-    initialize_runtime()
-    var num_workers = min(num_work_items, parallelism_level())
-    var chunk_size, extra_items = divmod(num_work_items, num_workers)
-
-    async def work_chunk(worker: Int, chunk_size: Int, extra_items: Int):
-        var begin = worker * chunk_size + min(worker, extra_items)
-        var count = chunk_size + Int(worker < extra_items)
-        for i in range(begin, begin + count):
-            func(i)
-
-    var tasks = TaskGroup()
-    for worker in range(num_workers):
-        tasks.create_task(work_chunk(worker, chunk_size, extra_items))
-    tasks.wait()
 
 
 # qhull: src/libqhull_r/geom_r.c qh_distplane
@@ -954,18 +928,56 @@ def mq_circumcenters(
     var rhs = fp(rhs_addr)
     var statuses = ip(statuses_addr)
 
-    @parameter
-    def solve_one(s: Int):
+    for s in range(count):
         statuses[s] = Int64(
             circumcenter_one(points, simplices, centers, matrix, rhs, s, dim)
         )
-
-    if count * dim * dim >= PARALLEL_SOLVE_WORK:
-        parallelize[solve_one](count)
-    else:
-        for s in range(count):
-            solve_one(s)
     for s in range(count):
         if statuses[s] == 0:
             return -(s + 1)
     return count
+
+
+@export("mq_circumcenters_range")
+def mq_circumcenters_range(
+    points_addr: Int,
+    simplices_addr: Int,
+    centers_addr: Int,
+    count: Int,
+    dim: Int,
+    matrix_addr: Int,
+    rhs_addr: Int,
+    statuses_addr: Int,
+    first: Int,
+    last: Int,
+) abi("C") -> Int:
+    """Solve simplices [first, last).
+
+    Every simplex owns a disjoint slice of centers, matrix, rhs and statuses,
+    so disjoint ranges are independent and the shim can fan them out.
+    """
+    if (
+        count <= 0
+        or dim <= 0
+        or first < 0
+        or last > count
+        or first > last
+        or points_addr == 0
+        or simplices_addr == 0
+        or centers_addr == 0
+        or matrix_addr == 0
+        or rhs_addr == 0
+        or statuses_addr == 0
+    ):
+        return -1
+    var points = fp(points_addr)
+    var simplices = ip(simplices_addr)
+    var centers = fp(centers_addr)
+    var matrix = fp(matrix_addr)
+    var rhs = fp(rhs_addr)
+    var statuses = ip(statuses_addr)
+    for s in range(first, last):
+        statuses[s] = Int64(
+            circumcenter_one(points, simplices, centers, matrix, rhs, s, dim)
+        )
+    return 0

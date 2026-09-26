@@ -1,12 +1,17 @@
-"""Internal buffer management and topology assembly."""
-
 from __future__ import annotations
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 from ._lib import addr, f64, lib
+
+# Each simplex solves its own dim x dim system over private scratch, so the
+# solve is compute-bound and disjoint simplex ranges fan out cleanly.
+_PARALLEL_MIN_SIMPLICES = 4096
+_MAX_WORKERS = min(32, os.cpu_count() or 1)
 
 
 class QhullError(ValueError):
@@ -180,7 +185,7 @@ def circumcenters(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     matrix = np.empty((len(simplices), dim, dim), dtype=np.float64)
     rhs = np.empty((len(simplices), dim), dtype=np.float64)
     statuses = np.empty(len(simplices), dtype=np.int64)
-    status = lib().mq_circumcenters(
+    args = (
         addr(points),
         addr(simplices),
         addr(centers),
@@ -190,6 +195,24 @@ def circumcenters(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
         addr(rhs),
         addr(statuses),
     )
-    if status < 0:
+    count = len(simplices)
+    workers = min(_MAX_WORKERS, count) if count >= _PARALLEL_MIN_SIMPLICES else 1
+    if workers > 1:
+        parts = [
+            ((index * count) // workers, ((index + 1) * count) // workers)
+            for index in range(workers)
+        ]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            codes = list(pool.map(
+                lambda part: lib().mq_circumcenters_range(*args, part[0], part[1]),
+                parts,
+            ))
+        if min(codes) < 0:
+            raise QhullError("singular Delaunay simplex")
+    else:
+        if lib().mq_circumcenters(*args) < 0:
+            raise QhullError("singular Delaunay simplex")
+    singular = np.flatnonzero(statuses == 0)
+    if singular.size:
         raise QhullError("singular Delaunay simplex")
     return centers

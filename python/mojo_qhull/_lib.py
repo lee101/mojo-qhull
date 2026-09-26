@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -22,6 +23,7 @@ _SIGNATURES = {
     "mq_topology_ridges": ([I] * 7, I),
     "mq_filter_lower_facets": ([I] * 7 + [D], I),
     "mq_circumcenters": ([I] * 8, I),
+    "mq_circumcenters_range": ([I] * 10, I),
 }
 
 _library: ctypes.CDLL | None = None
