@@ -46,8 +46,8 @@ def dist_plane(points: FPtr, point_i: Int, dim: Int, planes: FPtr, facet_i: Int)
     var k = 0
     while k + W <= dim:
         var dot = (
-            points.load[width=W](point_i * dim + k)
-            * planes.load[width=W](plane_base + k)
+            points.unsafe_load[width=W](point_i * dim + k)
+            * planes.unsafe_load[width=W](plane_base + k)
         ).reduce_add()
         value += dot
         k += W
@@ -192,10 +192,10 @@ def set_facet_plane(
     comptime W = simd_width_of[DType.float64]()
     var k = 0
     while k + W <= dim:
-        var normal = planes.load[width=W](facet_i * (dim + 1) + k) * invnorm
+        var normal = planes.unsafe_load[width=W](facet_i * (dim + 1) + k) * invnorm
         planes.store(facet_i * (dim + 1) + k, normal)
         var base_dot = (
-            points.load[width=W](Int(base) * dim + k) * normal
+            points.unsafe_load[width=W](Int(base) * dim + k) * normal
         ).reduce_add()
         offset -= base_dot
         k += W
@@ -210,8 +210,8 @@ def set_facet_plane(
     k = 0
     while k + W <= dim:
         var interior_dot = (
-            interior.load[width=W](k)
-            * planes.load[width=W](facet_i * (dim + 1) + k)
+            interior.unsafe_load[width=W](k)
+            * planes.unsafe_load[width=W](facet_i * (dim + 1) + k)
         ).reduce_add()
         interior_dist += interior_dot
         k += W
@@ -223,7 +223,7 @@ def set_facet_plane(
         while k + W <= dim + 1:
             planes.store(
                 facet_i * (dim + 1) + k,
-                -planes.load[width=W](facet_i * (dim + 1) + k),
+                -planes.unsafe_load[width=W](facet_i * (dim + 1) + k),
             )
             k += W
         while k < dim + 1:
@@ -586,9 +586,9 @@ def mq_lift_delaunay(points_addr: Int, lifted_addr: Int, n: Int, dim: Int) abi("
         comptime W = simd_width_of[DType.float64]()
         var k = 0
         while k + W <= dim:
-            var values = points.load[width=W](i * dim + k)
+            var values = points.unsafe_load[width=W](i * dim + k)
             lifted.store(i * (dim + 1) + k, values)
-            var mean = lifted.load[width=W](n * (dim + 1) + k)
+            var mean = lifted.unsafe_load[width=W](n * (dim + 1) + k)
             lifted.store(n * (dim + 1) + k, mean + values / Float64(n))
             paraboloid += (values * values).reduce_add()
             maxcoord = max(maxcoord, abs(values).reduce_max())
@@ -636,8 +636,8 @@ def mq_halfspace_dual(
         var k = 0
         while k + W <= dim:
             distance += (
-                halfspaces.load[width=W](i * (dim + 1) + k)
-                * feasible.load[width=W](k)
+                halfspaces.unsafe_load[width=W](i * (dim + 1) + k)
+                * feasible.unsafe_load[width=W](k)
             ).reduce_add()
             k += W
         while k < dim:
@@ -650,7 +650,7 @@ def mq_halfspace_dual(
         while k + W <= dim:
             dual.store(
                 i * dim + k,
-                halfspaces.load[width=W](i * (dim + 1) + k) * inverse,
+                halfspaces.unsafe_load[width=W](i * (dim + 1) + k) * inverse,
             )
             k += W
         while k < dim:
@@ -680,8 +680,8 @@ def mq_polar_vertices(
         while k + W <= dim:
             vertices.store(
                 i * dim + k,
-                feasible.load[width=W](k)
-                - planes.load[width=W](i * (dim + 1) + k) / offset,
+                feasible.unsafe_load[width=W](k)
+                - planes.unsafe_load[width=W](i * (dim + 1) + k) / offset,
             )
             k += W
         while k < dim:
@@ -873,7 +873,7 @@ def circumcenter_one(
     comptime W = simd_width_of[DType.float64]()
     var k = 0
     while k + W <= dim:
-        var values = points.load[width=W](base * dim + k)
+        var values = points.unsafe_load[width=W](base * dim + k)
         base_norm2 += (values * values).reduce_add()
         k += W
     while k < dim:
@@ -885,8 +885,8 @@ def circumcenter_one(
         var vertex_norm2 = 0.0
         k = 0
         while k + W <= dim:
-            var values = points.load[width=W](vertex * dim + k)
-            var base_values = points.load[width=W](base * dim + k)
+            var values = points.unsafe_load[width=W](vertex * dim + k)
+            var base_values = points.unsafe_load[width=W](base * dim + k)
             vertex_norm2 += (values * values).reduce_add()
             matrix.store(matrix_base + row * dim + k, 2.0 * (values - base_values))
             k += W
@@ -902,7 +902,7 @@ def circumcenter_one(
         return False
     k = 0
     while k + W <= dim:
-        centers.store(s * dim + k, rhs.load[width=W](rhs_base + k))
+        centers.store(s * dim + k, rhs.unsafe_load[width=W](rhs_base + k))
         k += W
     while k < dim:
         centers[s * dim + k] = rhs[rhs_base + k]
